@@ -1,0 +1,2216 @@
+--- a/ARTIFACT_README.txt
++++ b/ARTIFACT_README.txt
+@@ -0,0 +1,6 @@
++This folder contains a cleaned, upstream-oriented patch for `eigger/hass-niimbot`.
+
++
+
++Files:
+
++- `hass-niimbot-upstream-clean.patch` — unified diff against the current repo snapshot used for this work
+
++- `overlay/` — changed and new files ready to copy into a repo checkout
+
++- `UPSTREAM_PR.md` — PR-ready summary and rationale
+
+--- a/README.md
++++ b/README.md
+@@ -209,6 +209,8 @@
+ > [!TIP]
+
+ > When testing, use **`preview: true`** so the label is not actually printed. You can use the **[Niimbot Payload Layout Editor](https://eigger.github.io/Niimbot_Payload_Editor.html)** to design a layout via drag-and-drop in your browser and automatically generate YAML. Use the generated YAML with `preview: true` to preview it without sending data to the physical printer.
+
+ 
+
++If you prefer to stay inside Home Assistant, the integration can also expose a built-in **Niimbot Editor** sidebar panel for visual composition, live preview, template storage, and direct printing.
+
++
+
+ ```yaml
+
+ action: niimbot.print
+
+ data:
+
+--- a/UPSTREAM_PR.md
++++ b/UPSTREAM_PR.md
+@@ -0,0 +1,31 @@
++# Clean upstream PR draft
+
++
+
++## Summary
+
++Add an optional built-in **Niimbot Editor** sidebar panel to Home Assistant so users can compose labels visually, preview them live, save reusable templates, and print directly from the existing `niimbot` integration.
+
++
+
++## Why
+
++The integration README already points users to an external browser editor for drag-and-drop label design. This patch brings that workflow into Home Assistant itself while reusing the integration's current render and print path.
+
++
+
++## What is included
+
++- a sidebar panel registered through Home Assistant's custom panel system
+
++- WebSocket endpoints for:
+
++  - printer listing
+
++  - live preview rendering
+
++  - direct print
+
++  - template list/save/delete
+
++- lightweight template persistence using Home Assistant storage
+
++- a frontend panel served from the integration
+
++
+
++## Design choices
+
++- **No new companion integration**. The feature lives inside `niimbot`.
+
++- **No service contract changes**. Existing `niimbot.print` behavior stays untouched.
+
++- **Minimal manifest churn**. Only `frontend` is added as a dependency so panel registration happens after the UI stack is available.
+
++- **No version bump in the patch**. That can be handled by the maintainer at release time.
+
++
+
++## Caveats to disclose in the PR
+
++- This was syntax-checked, but not run in a live Home Assistant instance here.
+
++- The visual editor is strongest for common payload elements. Advanced nested payloads still benefit from the YAML/JSON view and the rendered preview remains the source of truth.
+
++- The feature stores templates globally in HA storage, not per user.
+
++
+
++## Suggested PR title
+
++Add built-in Niimbot label editor panel for preview, templates, and print
+
+--- a/custom_components/niimbot/__init__.py
++++ b/custom_components/niimbot/__init__.py
+@@ -7,6 +7,7 @@
+ from datetime import timedelta
+
+ from .niimprint import NiimbotDevice, BLEData, PrinterError
+
+ from .imagegen import customimage
+
++from .editor import async_setup_editor, async_unload_editor
+
+ from homeassistant.components import bluetooth
+
+ from homeassistant.config_entries import ConfigEntry
+
+ from homeassistant.const import Platform
+
+@@ -46,6 +47,20 @@
+ _LOGGER = logging.getLogger(__name__)
+
+ 
+
+ 
+
++
+
++async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+
++    """Set up the Niimbot integration domain."""
+
++    hass.data.setdefault(DOMAIN, {})
+
++    return True
+
++
+
++
+
++def _has_loaded_printers(hass: HomeAssistant) -> bool:
+
++    """Return True if at least one printer runtime is loaded."""
+
++    return any(
+
++        isinstance(runtime, dict) and "device" in runtime
+
++        for runtime in hass.data.get(DOMAIN, {}).values()
+
++    )
+
++
+
+ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+
+     """Set up Niimbot BLE device from a config entry."""
+
+     hass.data.setdefault(DOMAIN, {})
+
+@@ -199,6 +214,8 @@
+         DOMAIN, "print", printservice, supports_response=SupportsResponse.OPTIONAL
+
+     )
+
+ 
+
++    await async_setup_editor(hass)
+
++
+
+     return True
+
+ 
+
+ 
+
+@@ -208,5 +225,7 @@
+     await niimbot.disconnect()
+
+     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+
+         hass.data[DOMAIN].pop(entry.entry_id)
+
++        if not _has_loaded_printers(hass):
+
++            await async_unload_editor(hass)
+
+ 
+
+     return unload_ok
+
+--- a/custom_components/niimbot/const.py
++++ b/custom_components/niimbot/const.py
+@@ -19,3 +19,13 @@
+ )
+
+ 
+
+ ImageAndBLEData = tuple[Image, BLEData]
+
++
+
++
+
++# Built-in editor sidebar panel
+
++EDITOR_PANEL_STATIC_URL = "/niimbot_editor_static"
+
++EDITOR_PANEL_FRONTEND_FILENAME = "niimbot-editor.js"
+
++EDITOR_PANEL_URL_PATH = "niimbot-editor"
+
++EDITOR_PANEL_COMPONENT_NAME = "custom"
+
++EDITOR_PANEL_ELEMENT_NAME = "niimbot-editor-panel"
+
++EDITOR_STORE_KEY = "niimbot_editor_templates"
+
++EDITOR_STORE_VERSION = 1
+
+--- a/custom_components/niimbot/editor.py
++++ b/custom_components/niimbot/editor.py
+@@ -0,0 +1,358 @@
++"""Built-in Niimbot label editor sidebar panel."""
+
++
+
++from __future__ import annotations
+
++
+
++import base64
+
++import io
+
++from dataclasses import dataclass
+
++from datetime import UTC, datetime
+
++from pathlib import Path
+
++from typing import Any
+
++
+
++import voluptuous as vol
+
++from homeassistant.components import bluetooth, websocket_api
+
++from homeassistant.components.frontend import async_register_built_in_panel, async_remove_panel
+
++from homeassistant.components.http import StaticPathConfig
+
++from homeassistant.components.image import Image as HAImage
+
++from homeassistant.config_entries import ConfigEntry
+
++from homeassistant.core import HomeAssistant
+
++from homeassistant.exceptions import HomeAssistantError
+
++from homeassistant.helpers import config_validation as cv
+
++from homeassistant.util import slugify
+
++
+
++from .const import (
+
++    DOMAIN,
+
++    EDITOR_PANEL_COMPONENT_NAME,
+
++    EDITOR_PANEL_ELEMENT_NAME,
+
++    EDITOR_PANEL_FRONTEND_FILENAME,
+
++    EDITOR_PANEL_STATIC_URL,
+
++    EDITOR_PANEL_URL_PATH,
+
++)
+
++from .editor_store import TemplateStore
+
++from .imagegen import customimage
+
++
+
++
+
++@dataclass(slots=True)
+
++class _RenderRequest:
+
++    """Tiny stand-in that exposes .data like a ServiceCall."""
+
++
+
++    data: dict[str, Any]
+
++
+
++
+
++def _image_to_data_uri(image_bytes: bytes) -> str:
+
++    encoded = base64.b64encode(image_bytes).decode("ascii")
+
++    return f"data:image/png;base64,{encoded}"
+
++
+
++
+
++async def _async_render_image(
+
++    hass: HomeAssistant,
+
++    entry_id: str,
+
++    data: dict[str, Any],
+
++) -> tuple[Any, bytes, str]:
+
++    image = await hass.async_add_executor_job(
+
++        customimage,
+
++        entry_id,
+
++        _RenderRequest(data=data),
+
++        hass,
+
++    )
+
++    buffer = io.BytesIO()
+
++    image.save(buffer, format="PNG")
+
++    raw = buffer.getvalue()
+
++    return image, raw, _image_to_data_uri(raw)
+
++
+
++
+
++def _get_template_store(hass: HomeAssistant) -> TemplateStore:
+
++    store = hass.data[DOMAIN].get("_editor_store")
+
++    if store is None:
+
++        store = TemplateStore(hass)
+
++        hass.data[DOMAIN]["_editor_store"] = store
+
++    return store
+
++
+
++
+
++def _get_runtime(hass: HomeAssistant, entry_id: str) -> dict[str, Any]:
+
++    runtime = hass.data.get(DOMAIN, {}).get(entry_id)
+
++    if runtime is None:
+
++        raise HomeAssistantError(
+
++            f"Niimbot entry '{entry_id}' is not loaded. "
+
++            "Make sure the printer integration is configured and loaded."
+
++        )
+
++    return runtime
+
++
+
++
+
++def _get_entry(hass: HomeAssistant, entry_id: str) -> ConfigEntry:
+
++    entry = hass.config_entries.async_get_entry(entry_id)
+
++    if entry is None or entry.domain != DOMAIN:
+
++        raise HomeAssistantError(f"Unknown Niimbot config entry '{entry_id}'.")
+
++    return entry
+
++
+
++
+
++def _list_fonts(hass: HomeAssistant) -> list[str]:
+
++    fonts: set[str] = set()
+
++
+
++    integration_dir = Path(__file__).resolve().parent
+
++    for pattern in ("*.ttf", "*.otf"):
+
++        fonts.update(path.name for path in integration_dir.glob(pattern))
+
++
+
++    www_fonts_dir = Path(hass.config.path("www/fonts"))
+
++    if www_fonts_dir.exists():
+
++        for pattern in ("*.ttf", "*.otf"):
+
++            fonts.update(path.name for path in www_fonts_dir.glob(pattern))
+
++
+
++    return sorted(fonts)
+
++
+
++
+
++@websocket_api.websocket_command(
+
++    {
+
++        vol.Required("type"): "niimbot/editor/list_printers",
+
++    }
+
++)
+
++@websocket_api.async_response
+
++async def ws_list_printers(
+
++    hass: HomeAssistant,
+
++    connection: websocket_api.ActiveConnection,
+
++    msg: dict[str, Any],
+
++) -> None:
+
++    """Return configured Niimbot printers and available fonts."""
+
++    printers: list[dict[str, Any]] = []
+
++    for entry in hass.config_entries.async_entries(DOMAIN):
+
++        printers.append(
+
++            {
+
++                "entry_id": entry.entry_id,
+
++                "title": entry.title,
+
++                "address": entry.unique_id,
+
++                "loaded": entry.entry_id in hass.data.get(DOMAIN, {}),
+
++            }
+
++        )
+
++
+
++    connection.send_result(
+
++        msg["id"],
+
++        {
+
++            "printers": printers,
+
++            "fonts": _list_fonts(hass),
+
++        },
+
++    )
+
++
+
++
+
++@websocket_api.websocket_command(
+
++    {
+
++        vol.Required("type"): "niimbot/editor/preview",
+
++        vol.Required("entry_id"): str,
+
++        vol.Required("payload"): [dict],
+
++        vol.Optional("width", default=400): vol.All(vol.Coerce(int), vol.Range(min=10, max=1600)),
+
++        vol.Optional("height", default=240): vol.All(vol.Coerce(int), vol.Range(min=10, max=1600)),
+
++        vol.Optional("rotate", default=0): vol.In([0, 90, 180, 270]),
+
++        vol.Optional("density", default=3): vol.All(vol.Coerce(int), vol.Range(min=1, max=5)),
+
++    }
+
++)
+
++@websocket_api.async_response
+
++async def ws_preview(
+
++    hass: HomeAssistant,
+
++    connection: websocket_api.ActiveConnection,
+
++    msg: dict[str, Any],
+
++) -> None:
+
++    """Render a preview image for the editor."""
+
++    try:
+
++        _get_runtime(hass, msg["entry_id"])
+
++        _, raw, data_uri = await _async_render_image(
+
++            hass,
+
++            msg["entry_id"],
+
++            {
+
++                "payload": msg["payload"],
+
++                "width": msg["width"],
+
++                "height": msg["height"],
+
++                "rotate": msg["rotate"],
+
++                "density": msg["density"],
+
++                "preview": True,
+
++            },
+
++        )
+
++    except Exception as err:  # noqa: BLE001
+
++        connection.send_error(msg["id"], "preview_failed", str(err))
+
++        return
+
++
+
++    connection.send_result(
+
++        msg["id"],
+
++        {
+
++            "image": data_uri,
+
++            "size": {"bytes": len(raw)},
+
++        },
+
++    )
+
++
+
++
+
++@websocket_api.websocket_command(
+
++    {
+
++        vol.Required("type"): "niimbot/editor/print",
+
++        vol.Required("entry_id"): str,
+
++        vol.Required("payload"): [dict],
+
++        vol.Optional("width", default=400): vol.All(vol.Coerce(int), vol.Range(min=10, max=1600)),
+
++        vol.Optional("height", default=240): vol.All(vol.Coerce(int), vol.Range(min=10, max=1600)),
+
++        vol.Optional("rotate", default=0): vol.In([0, 90, 180, 270]),
+
++        vol.Optional("density", default=3): vol.All(vol.Coerce(int), vol.Range(min=1, max=5)),
+
++        vol.Optional("wait_between_print_lines", default=0.05): vol.Coerce(float),
+
++        vol.Optional("print_line_batch_size", default=1): vol.All(vol.Coerce(int), vol.Range(min=1, max=512)),
+
++    }
+
++)
+
++@websocket_api.async_response
+
++async def ws_print(
+
++    hass: HomeAssistant,
+
++    connection: websocket_api.ActiveConnection,
+
++    msg: dict[str, Any],
+
++) -> None:
+
++    """Render and print a label."""
+
++    try:
+
++        entry = _get_entry(hass, msg["entry_id"])
+
++        runtime = _get_runtime(hass, msg["entry_id"])
+
++
+
++        image, raw, data_uri = await _async_render_image(
+
++            hass,
+
++            msg["entry_id"],
+
++            {
+
++                "payload": msg["payload"],
+
++                "width": msg["width"],
+
++                "height": msg["height"],
+
++                "rotate": msg["rotate"],
+
++                "density": msg["density"],
+
++            },
+
++        )
+
++
+
++        ble_device = bluetooth.async_ble_device_from_address(hass, entry.unique_id)
+
++        if ble_device is None:
+
++            raise HomeAssistantError(
+
++                f"Could not find printer with address {entry.unique_id} through Home Assistant Bluetooth."
+
++            )
+
++
+
++        result = await runtime["device"].print_image(
+
++            ble_device,
+
++            image,
+
++            density=msg["density"],
+
++            wait_between_print_lines=msg["wait_between_print_lines"],
+
++            print_line_batch_size=msg["print_line_batch_size"],
+
++        )
+
++
+
++        image_coordinator = runtime.get("image_coordinator")
+
++        coordinator = runtime.get("coordinator")
+
++        if image_coordinator is not None and coordinator is not None:
+
++            image_coordinator.async_set_updated_data(
+
++                (
+
++                    HAImage(content_type="image/png", content=raw),
+
++                    coordinator.data,
+
++                )
+
++            )
+
++
+
++        connection.send_result(
+
++            msg["id"],
+
++            {
+
++                "image": data_uri,
+
++                "result": result,
+
++            },
+
++        )
+
++    except Exception as err:  # noqa: BLE001
+
++        connection.send_error(msg["id"], "print_failed", str(err))
+
++
+
++
+
++@websocket_api.websocket_command(
+
++    {
+
++        vol.Required("type"): "niimbot/editor/list_templates",
+
++    }
+
++)
+
++@websocket_api.async_response
+
++async def ws_list_templates(
+
++    hass: HomeAssistant,
+
++    connection: websocket_api.ActiveConnection,
+
++    msg: dict[str, Any],
+
++) -> None:
+
++    """List saved templates."""
+
++    templates = await _get_template_store(hass).list_templates()
+
++    connection.send_result(msg["id"], {"templates": templates})
+
++
+
++
+
++@websocket_api.websocket_command(
+
++    {
+
++        vol.Required("type"): "niimbot/editor/save_template",
+
++        vol.Required("name"): cv.string,
+
++        vol.Required("label"): dict,
+
++        vol.Required("payload"): [dict],
+
++    }
+
++)
+
++@websocket_api.async_response
+
++async def ws_save_template(
+
++    hass: HomeAssistant,
+
++    connection: websocket_api.ActiveConnection,
+
++    msg: dict[str, Any],
+
++) -> None:
+
++    """Save a template."""
+
++    name = msg["name"].strip()
+
++    if not name:
+
++        connection.send_error(msg["id"], "invalid_name", "Template name cannot be empty.")
+
++        return
+
++
+
++    safe_name = name[:100]
+
++    await _get_template_store(hass).save_template(
+
++        safe_name,
+
++        label=msg["label"],
+
++        payload=msg["payload"],
+
++        updated_at=datetime.now(UTC).isoformat(),
+
++    )
+
++    connection.send_result(msg["id"], {"ok": True, "slug": slugify(safe_name)})
+
++
+
++
+
++@websocket_api.websocket_command(
+
++    {
+
++        vol.Required("type"): "niimbot/editor/delete_template",
+
++        vol.Required("name"): cv.string,
+
++    }
+
++)
+
++@websocket_api.async_response
+
++async def ws_delete_template(
+
++    hass: HomeAssistant,
+
++    connection: websocket_api.ActiveConnection,
+
++    msg: dict[str, Any],
+
++) -> None:
+
++    """Delete a template."""
+
++    await _get_template_store(hass).delete_template(msg["name"])
+
++    connection.send_result(msg["id"], {"ok": True})
+
++
+
++
+
++async def async_setup_editor(hass: HomeAssistant) -> None:
+
++    """Register static assets, panel, and websocket commands."""
+
++    if hass.data[DOMAIN].get("_editor_panel_registered"):
+
++        return
+
++
+
++    frontend_dir = Path(__file__).resolve().parent / "frontend"
+
++    await hass.http.async_register_static_paths(
+
++        [StaticPathConfig(EDITOR_PANEL_STATIC_URL, str(frontend_dir), cache_headers=False)]
+
++    )
+
++
+
++    async_register_built_in_panel(
+
++        hass,
+
++        component_name=EDITOR_PANEL_COMPONENT_NAME,
+
++        sidebar_title="Niimbot Editor",
+
++        sidebar_icon="mdi:label-outline",
+
++        frontend_url_path=EDITOR_PANEL_URL_PATH,
+
++        config={
+
++            "_panel_custom": {
+
++                "name": EDITOR_PANEL_ELEMENT_NAME,
+
++                "js_url": f"{EDITOR_PANEL_STATIC_URL}/{EDITOR_PANEL_FRONTEND_FILENAME}",
+
++                "embed_iframe": False,
+
++                "trust_external": False,
+
++            }
+
++        },
+
++        require_admin=False,
+
++    )
+
++
+
++    websocket_api.async_register_command(hass, ws_list_printers)
+
++    websocket_api.async_register_command(hass, ws_preview)
+
++    websocket_api.async_register_command(hass, ws_print)
+
++    websocket_api.async_register_command(hass, ws_list_templates)
+
++    websocket_api.async_register_command(hass, ws_save_template)
+
++    websocket_api.async_register_command(hass, ws_delete_template)
+
++
+
++    hass.data[DOMAIN]["_editor_panel_registered"] = True
+
++
+
++
+
++async def async_unload_editor(hass: HomeAssistant) -> None:
+
++    """Remove the sidebar panel when the last printer unloads."""
+
++    if not hass.data.get(DOMAIN, {}).get("_editor_panel_registered"):
+
++        return
+
++
+
++    async_remove_panel(hass, EDITOR_PANEL_URL_PATH)
+
++    hass.data[DOMAIN]["_editor_panel_registered"] = False
+
+--- a/custom_components/niimbot/editor_store.py
++++ b/custom_components/niimbot/editor_store.py
+@@ -0,0 +1,72 @@
++"""Storage helpers for saved Niimbot label templates."""
+
++
+
++from __future__ import annotations
+
++
+
++from copy import deepcopy
+
++from typing import Any
+
++
+
++from homeassistant.core import HomeAssistant
+
++from homeassistant.helpers.storage import Store
+
++
+
++from .const import EDITOR_STORE_KEY, EDITOR_STORE_VERSION
+
++
+
++
+
++class TemplateStore:
+
++    """Persist saved label templates."""
+
++
+
++    def __init__(self, hass: HomeAssistant) -> None:
+
++        self._store: Store[dict[str, Any]] = Store(
+
++            hass,
+
++            EDITOR_STORE_VERSION,
+
++            EDITOR_STORE_KEY,
+
++        )
+
++        self._cache: dict[str, Any] | None = None
+
++
+
++    async def _load(self) -> dict[str, Any]:
+
++        if self._cache is None:
+
++            self._cache = await self._store.async_load() or {"templates": {}}
+
++            self._cache.setdefault("templates", {})
+
++        return self._cache
+
++
+
++    async def list_templates(self) -> list[dict[str, Any]]:
+
++        """Return saved templates."""
+
++        data = await self._load()
+
++        templates: list[dict[str, Any]] = []
+
++
+
++        for name, template in sorted(
+
++            data["templates"].items(),
+
++            key=lambda item: item[0].lower(),
+
++        ):
+
++            templates.append(
+
++                {
+
++                    "name": name,
+
++                    "label": deepcopy(template.get("label", {})),
+
++                    "payload": deepcopy(template.get("payload", [])),
+
++                    "updated_at": template.get("updated_at"),
+
++                }
+
++            )
+
++
+
++        return templates
+
++
+
++    async def save_template(
+
++        self,
+
++        name: str,
+
++        label: dict[str, Any],
+
++        payload: list[dict[str, Any]],
+
++        updated_at: str | None = None,
+
++    ) -> None:
+
++        """Save a template."""
+
++        data = await self._load()
+
++        data["templates"][name] = {
+
++            "label": deepcopy(label),
+
++            "payload": deepcopy(payload),
+
++            "updated_at": updated_at,
+
++        }
+
++        await self._store.async_save(data)
+
++
+
++    async def delete_template(self, name: str) -> None:
+
++        """Delete a template if present."""
+
++        data = await self._load()
+
++        if name in data["templates"]:
+
++            del data["templates"][name]
+
++            await self._store.async_save(data)
+
+--- a/custom_components/niimbot/frontend/niimbot-editor.js
++++ b/custom_components/niimbot/frontend/niimbot-editor.js
+@@ -0,0 +1,554 @@
++
+
++class NiimbotLabelEditorPanel extends HTMLElement {
+
++  constructor() {
+
++    super();
+
++    this.attachShadow({ mode: "open" });
+
++    this._hass = null;
+
++    this._booted = false;
+
++    this._drag = null;
+
++    this._previewTimer = null;
+
++
+
++    this.state = {
+
++      printers: [],
+
++      fonts: [],
+
++      templates: [],
+
++      selectedPrinter: "",
+
++      width: 400,
+
++      height: 240,
+
++      rotate: 0,
+
++      density: 3,
+
++            payload: [],
+
++      selectedIndex: -1,
+
++      previewImage: "",
+
++      yamlText: "",
+
++      busy: false,
+
++      printing: false,
+
++      error: "",
+
++      info: "",
+
++      lastSavedTemplate: "",
+
++    };
+
++  }
+
++
+
++  set hass(hass) {
+
++    this._hass = hass;
+
++    if (!this._booted && hass) {
+
++      this._booted = true;
+
++      this._bootstrap();
+
++    }
+
++    this.render();
+
++  }
+
++
+
++  set panel(panel) { this._panel = panel; }
+
++  set narrow(narrow) { this._narrow = narrow; }
+
++  set route(route) { this._route = route; }
+
++  connectedCallback() { this.render(); }
+
++  disconnectedCallback() {
+
++    window.removeEventListener("mousemove", this._boundMouseMove);
+
++    window.removeEventListener("mouseup", this._boundMouseUp);
+
++  }
+
++
+
++  async _bootstrap() {
+
++    try {
+
++      const printerResp = await this._hass.callWS({ type: "niimbot/editor/list_printers" });
+
++      const templateResp = await this._hass.callWS({ type: "niimbot/editor/list_templates" });
+
++      this.state.printers = printerResp.printers || [];
+
++      this.state.fonts = printerResp.fonts || [];
+
++      this.state.templates = templateResp.templates || [];
+
++      if (!this.state.selectedPrinter && this.state.printers.length) {
+
++        const loaded = this.state.printers.find((p) => p.loaded) || this.state.printers[0];
+
++        this.state.selectedPrinter = loaded.entry_id;
+
++      }
+
++      this._ensureDefaultContent();
+
++      this._refreshYaml();
+
++      if (this.state.selectedPrinter) this._schedulePreview(0);
+
++      this.render();
+
++    } catch (err) {
+
++      this.state.error = this._friendlyError(err);
+
++      this.render();
+
++    }
+
++  }
+
++
+
++  _ensureDefaultContent() {
+
++    if (this.state.payload.length) return;
+
++    const font = this.state.fonts[0] || "ppb.ttf";
+
++    this.state.payload = [
+
++      { type: "text", value: "Hello Niimbot", x: 20, y: 26, size: 36, font, color: "black" },
+
++      { type: "rectangle", x_start: 16, y_start: 56, x_end: 240, y_end: 120, width: 2, outline: "black", fill: "white" },
+
++      { type: "qrcode", x: 270, y: 20, data: "https://www.home-assistant.io", boxsize: 2, border: 1, color: "black", bgcolor: "white" },
+
++    ];
+
++    this.state.selectedIndex = 0;
+
++  }
+
++
+
++  _friendlyError(err) {
+
++    if (!err) return "Unknown error";
+
++    if (typeof err === "string") return err;
+
++    if (err.message) return err.message;
+
++    return JSON.stringify(err);
+
++  }
+
++
+
++  _deepClone(obj) { return JSON.parse(JSON.stringify(obj)); }
+
++  _schedulePreview(delay = 350) { clearTimeout(this._previewTimer); this._previewTimer = window.setTimeout(() => this._preview(), delay); }
+
++
+
++  async _preview() {
+
++    if (!this._hass || !this.state.selectedPrinter) return;
+
++    this.state.busy = true; this.state.error = ""; this.render();
+
++    try {
+
++      const resp = await this._hass.callWS({
+
++        type: "niimbot/editor/preview",
+
++        entry_id: this.state.selectedPrinter,
+
++        width: Number(this.state.width),
+
++        height: Number(this.state.height),
+
++        rotate: Number(this.state.rotate),
+
++        density: Number(this.state.density),
+
++        payload: this.state.payload,
+
++      });
+
++      this.state.previewImage = resp.image || "";
+
++      this.state.busy = false;
+
++      this._refreshYaml();
+
++      this.render();
+
++    } catch (err) {
+
++      this.state.busy = false;
+
++      this.state.error = this._friendlyError(err);
+
++      this.render();
+
++    }
+
++  }
+
++
+
++  async _print() {
+
++    if (!this._hass || !this.state.selectedPrinter) return;
+
++    this.state.printing = true; this.state.error = ""; this.state.info = ""; this.render();
+
++    try {
+
++      const resp = await this._hass.callWS({
+
++        type: "niimbot/editor/print",
+
++        entry_id: this.state.selectedPrinter,
+
++        width: Number(this.state.width),
+
++        height: Number(this.state.height),
+
++        rotate: Number(this.state.rotate),
+
++        density: Number(this.state.density),
+
++        payload: this.state.payload,
+
++      });
+
++      this.state.previewImage = resp.image || this.state.previewImage;
+
++      this.state.info = "Sent to printer.";
+
++    } catch (err) {
+
++      this.state.error = this._friendlyError(err);
+
++    } finally {
+
++      this.state.printing = false;
+
++      this.render();
+
++    }
+
++  }
+
++
+
++  async _reloadTemplates() {
+
++    const resp = await this._hass.callWS({ type: "niimbot/editor/list_templates" });
+
++    this.state.templates = resp.templates || [];
+
++  }
+
++
+
++  async _saveTemplate() {
+
++    const currentName = this.state.lastSavedTemplate || "";
+
++    const name = window.prompt("Template name", currentName);
+
++    if (!name) return;
+
++    await this._hass.callWS({
+
++      type: "niimbot/editor/save_template",
+
++      name,
+
++      label: {
+
++        width: Number(this.state.width),
+
++        height: Number(this.state.height),
+
++        rotate: Number(this.state.rotate),
+
++        density: Number(this.state.density),
+
++      },
+
++      payload: this.state.payload,
+
++    });
+
++    this.state.lastSavedTemplate = name;
+
++    await this._reloadTemplates();
+
++    this.state.info = `Saved template “${name}”.`;
+
++    this.render();
+
++  }
+
++
+
++  async _deleteTemplate(name) {
+
++    if (!name) return;
+
++    if (!window.confirm(`Delete template "${name}"?`)) return;
+
++    await this._hass.callWS({ type: "niimbot/editor/delete_template", name });
+
++    if (this.state.lastSavedTemplate === name) this.state.lastSavedTemplate = "";
+
++    await this._reloadTemplates();
+
++    this.state.info = `Deleted template “${name}”.`;
+
++    this.render();
+
++  }
+
++
+
++  _loadTemplate(name) {
+
++    const found = this.state.templates.find((t) => t.name === name);
+
++    if (!found) return;
+
++    this.state.lastSavedTemplate = found.name;
+
++    this.state.width = found.label?.width ?? 400;
+
++    this.state.height = found.label?.height ?? 240;
+
++    this.state.rotate = found.label?.rotate ?? 0;
+
++    this.state.density = found.label?.density ?? 3;
+
++    this.state.payload = this._deepClone(found.payload || []);
+
++    this.state.selectedIndex = this.state.payload.length ? 0 : -1;
+
++    this.state.info = `Loaded template “${name}”.`;
+
++    this._refreshYaml();
+
++    this._schedulePreview(0);
+
++    this.render();
+
++  }
+
++
+
++  _refreshYaml() {
+
++    const payloadYaml = this._toYaml(this.state.payload, 4);
+
++    this.state.yamlText = `action: niimbot.print\ndata:\n  width: ${Number(this.state.width)}\n  height: ${Number(this.state.height)}\n  rotate: ${Number(this.state.rotate)}\n  density: ${Number(this.state.density)}\n  payload:\n${payloadYaml}\ntarget:\n  device_id: <your_device_id>`;
+
++  }
+
++
+
++  _toYaml(value, indent = 0) {
+
++    const pad = " ".repeat(indent);
+
++    if (Array.isArray(value)) {
+
++      if (!value.length) return `${pad}[]`;
+
++      return value.map((item) => {
+
++        if (item && typeof item === "object" && !Array.isArray(item)) {
+
++          const inner = Object.entries(item).map(([k, v]) => this._yamlKeyValue(k, v, indent + 2)).join("\n");
+
++          return `${pad}- ${inner.slice(indent + 2)}`;
+
++        }
+
++        return `${pad}- ${this._scalarYaml(item)}`;
+
++      }).join("\n");
+
++    }
+
++    if (value && typeof value === "object") {
+
++      return Object.entries(value).map(([k, v]) => this._yamlKeyValue(k, v, indent)).join("\n");
+
++    }
+
++    return `${pad}${this._scalarYaml(value)}`;
+
++  }
+
++
+
++  _yamlKeyValue(key, value, indent = 0) {
+
++    const pad = " ".repeat(indent);
+
++    if (Array.isArray(value)) {
+
++      if (!value.length) return `${pad}${key}: []`;
+
++      const list = value.map((item) => {
+
++        if (item && typeof item === "object" && !Array.isArray(item)) {
+
++          const inner = Object.entries(item).map(([k, v]) => this._yamlKeyValue(k, v, indent + 4)).join("\n");
+
++          return `${" ".repeat(indent + 2)}- ${inner.slice(indent + 4)}`;
+
++        }
+
++        return `${" ".repeat(indent + 2)}- ${this._scalarYaml(item)}`;
+
++      }).join("\n");
+
++      return `${pad}${key}:\n${list}`;
+
++    }
+
++    if (value && typeof value === "object") {
+
++      return `${pad}${key}:\n${this._toYaml(value, indent + 2)}`;
+
++    }
+
++    if (typeof value === "string" && value.includes("\n")) {
+
++      const lines = value.split("\n").map((line) => `${" ".repeat(indent + 2)}${line}`).join("\n");
+
++      return `${pad}${key}: |-\n${lines}`;
+
++    }
+
++    return `${pad}${key}: ${this._scalarYaml(value)}`;
+
++  }
+
++
+
++  _scalarYaml(value) {
+
++    if (typeof value === "number" || typeof value === "boolean") return String(value);
+
++    if (value === null || value === undefined) return "null";
+
++    const str = String(value);
+
++    if (/^[A-Za-z0-9_.:/-]+$/.test(str)) return str;
+
++    return JSON.stringify(str);
+
++  }
+
++
+
++  _defaultsForType(type) {
+
++    const font = this.state.fonts[0] || "ppb.ttf";
+
++    const centerX = Math.round(this.state.width / 2);
+
++    const centerY = Math.round(this.state.height / 2);
+
++    const map = {
+
++      text: { type, value: "Text", x: 20, y: 20, size: 28, font, color: "black" },
+
++      multiline: { type, value: "Line1;Line2;Line3", delimiter: ";", x: 20, start_y: 20, offset_y: 26, size: 18, font, color: "black" },
+
++      new_multiline: { type, value: "Line 1\nLine 2", x: 20, y: 20, width: 220, height: 90, fit: true, size: 40, font, color: "black" },
+
++      line: { type, x_start: 20, y_start: 20, x_end: 180, y_end: 20, width: 2, fill: "black" },
+
++      rectangle: { type, x_start: 20, y_start: 20, x_end: 180, y_end: 100, width: 2, outline: "black", fill: "white", radius: 0 },
+
++      rectangle_pattern: { type, x_start: 20, y_start: 20, x_size: 14, y_size: 14, x_repeat: 4, y_repeat: 3, x_offset: 6, y_offset: 6, width: 1, outline: "black", fill: "white" },
+
++      circle: { type, x: centerX, y: centerY, radius: 28, width: 2, outline: "black", fill: "white" },
+
++      ellipse: { type, x_start: 30, y_start: 20, x_end: 180, y_end: 90, width: 2, outline: "black", fill: "white" },
+
++      icon: { type, value: "mdi:home-assistant", x: 20, y: 20, size: 64, color: "black", anchor: "la" },
+
++      dlimg: { type, url: "https://example.com/image.png", x: 20, y: 20, xsize: 80, ysize: 80, rotate: 0 },
+
++      qrcode: { type, data: "https://www.home-assistant.io", x: 20, y: 20, boxsize: 2, border: 1, color: "black", bgcolor: "white", eclevel: "h" },
+
++      datamatrix: { type, data: "123456", x: 20, y: 20, boxsize: 2, color: "black", bgcolor: "white" },
+
++      barcode: { type, data: "123456789012", x: 20, y: 20, code: "code128", color: "black", bgcolor: "white", module_width: 0.2, module_height: 7, quiet_zone: 6.5, font_size: 5, text_distance: 5, write_text: true },
+
++      progress_bar: { type, x_start: 20, y_start: 20, x_end: 220, y_end: 44, progress: 65, direction: "right", background: "white", fill: "black", outline: "black", width: 1, show_percentage: true },
+
++      diagram: { type, x: 0, y: 0, width: 250, height: 128, margin: 20, font, bars: { values: "Mon,10;Tue,25;Wed,15", color: "black", margin: 10, legend_size: 10, legend_color: "black" } },
+
++      plot: { type, data: [{ entity: "sensor.example", color: "black", width: 2 }], duration: 86400, x_start: 30, y_start: 10, x_end: 290, y_end: 120, size: 10, font, low: 0, high: 100 },
+
++    };
+
++    return this._deepClone(map[type] || { type });
+
++  }
+
++
+
++  _addElement(type) {
+
++    const item = this._defaultsForType(type);
+
++    this.state.payload = [...this.state.payload, item];
+
++    this.state.selectedIndex = this.state.payload.length - 1;
+
++    this._refreshYaml();
+
++    this._schedulePreview(0);
+
++    this.render();
+
++  }
+
++
+
++  _removeSelected() {
+
++    if (this.state.selectedIndex < 0) return;
+
++    this.state.payload.splice(this.state.selectedIndex, 1);
+
++    if (this.state.selectedIndex >= this.state.payload.length) this.state.selectedIndex = this.state.payload.length - 1;
+
++    this._refreshYaml();
+
++    this._schedulePreview(0);
+
++    this.render();
+
++  }
+
++
+
++  _duplicateSelected() {
+
++    const el = this.state.payload[this.state.selectedIndex];
+
++    if (!el) return;
+
++    const clone = this._deepClone(el);
+
++    this._offsetElement(clone, 12, 12);
+
++    this.state.payload.splice(this.state.selectedIndex + 1, 0, clone);
+
++    this.state.selectedIndex += 1;
+
++    this._refreshYaml();
+
++    this._schedulePreview(0);
+
++    this.render();
+
++  }
+
++
+
++  _offsetElement(el, dx, dy) {
+
++    const keys = ["x", "y", "x_start", "x_end", "y_start", "y_end", "start_y"];
+
++    for (const key of keys) {
+
++      if (typeof el[key] === "number") {
+
++        if (key.startsWith("x")) el[key] += dx; else el[key] += dy;
+
++      }
+
++    }
+
++  }
+
++
+
++  _moveElement(el, dx, dy) {
+
++    if (typeof el.x === "number") el.x += dx;
+
++    if (typeof el.y === "number") el.y += dy;
+
++    if (typeof el.start_y === "number") el.start_y += dy;
+
++    if (typeof el.x_start === "number") el.x_start += dx;
+
++    if (typeof el.x_end === "number") el.x_end += dx;
+
++    if (typeof el.y_start === "number") el.y_start += dy;
+
++    if (typeof el.y_end === "number") el.y_end += dy;
+
++  }
+
++
+
++  _elementBox(el) {
+
++    const type = el.type;
+
++    if (type === "text") return { x: el.x ?? 0, y: el.y ?? 0, w: Math.max(70, (el.value || "").length * ((el.size || 20) * 0.55)), h: (el.size || 20) + 8 };
+
++    if (type === "multiline") return { x: el.x ?? 0, y: el.start_y ?? 0, w: 150, h: 80 };
+
++    if (type === "new_multiline") return { x: el.x ?? 0, y: el.y ?? 0, w: el.width ?? 160, h: el.height ?? 90 };
+
++    if (type === "line") {
+
++      const x1 = el.x_start ?? 0, x2 = el.x_end ?? 0, y1 = el.y_start ?? 0, y2 = el.y_end ?? y1;
+
++      return { x: Math.min(x1, x2), y: Math.min(y1, y2), w: Math.max(4, Math.abs(x2 - x1)), h: Math.max(4, Math.abs(y2 - y1)) };
+
++    }
+
++    if (["rectangle", "ellipse", "progress_bar", "plot"].includes(type)) {
+
++      const x1 = el.x_start ?? 0, x2 = el.x_end ?? 120, y1 = el.y_start ?? 0, y2 = el.y_end ?? 80;
+
++      return { x: Math.min(x1, x2), y: Math.min(y1, y2), w: Math.abs(x2 - x1), h: Math.abs(y2 - y1) };
+
++    }
+
++    if (type === "rectangle_pattern") {
+
++      const w = (el.x_size ?? 10) * (el.x_repeat ?? 1) + (el.x_offset ?? 0) * Math.max(0, (el.x_repeat ?? 1) - 1);
+
++      const h = (el.y_size ?? 10) * (el.y_repeat ?? 1) + (el.y_offset ?? 0) * Math.max(0, (el.y_repeat ?? 1) - 1);
+
++      return { x: el.x_start ?? 0, y: el.y_start ?? 0, w, h };
+
++    }
+
++    if (type === "circle") return { x: (el.x ?? 0) - (el.radius ?? 10), y: (el.y ?? 0) - (el.radius ?? 10), w: (el.radius ?? 10) * 2, h: (el.radius ?? 10) * 2 };
+
++    if (type === "icon") return { x: el.x ?? 0, y: (el.y ?? 0) - (el.size ?? 40), w: el.size ?? 40, h: el.size ?? 40 };
+
++    if (type === "dlimg") return { x: el.x ?? 0, y: el.y ?? 0, w: el.xsize ?? 80, h: el.ysize ?? 80 };
+
++    if (["qrcode", "datamatrix"].includes(type)) {
+
++      const side = Math.max(24, ((el.boxsize ?? 2) * 18) + ((el.border ?? 1) * 8));
+
++      return { x: el.x ?? 0, y: el.y ?? 0, w: side, h: side };
+
++    }
+
++    if (type === "barcode") return { x: el.x ?? 0, y: el.y ?? 0, w: 170, h: 70 };
+
++    if (type === "diagram") return { x: el.x ?? 0, y: el.y ?? 0, w: el.width ?? 180, h: el.height ?? 120 };
+
++    return { x: 10, y: 10, w: 80, h: 50 };
+
++  }
+
++
+
++  _stageScale() {
+
++    const maxW = 600, maxH = 420;
+
++    const scale = Math.min(maxW / Math.max(1, this.state.width), maxH / Math.max(1, this.state.height), 1.75);
+
++    return Number.isFinite(scale) ? scale : 1;
+
++  }
+
++
+
++  _startDrag(ev, index) {
+
++    ev.preventDefault(); ev.stopPropagation();
+
++    this.state.selectedIndex = index;
+
++    const el = this.state.payload[index];
+
++    if (!el) return;
+
++    const scale = this._stageScale();
+
++    this._drag = { index, startX: ev.clientX, startY: ev.clientY, original: this._deepClone(el), scale };
+
++    this._boundMouseMove = this._boundMouseMove || ((e) => this._onDragMove(e));
+
++    this._boundMouseUp = this._boundMouseUp || (() => this._onDragEnd());
+
++    window.addEventListener("mousemove", this._boundMouseMove);
+
++    window.addEventListener("mouseup", this._boundMouseUp);
+
++    this.render();
+
++  }
+
++
+
++  _onDragMove(ev) {
+
++    if (!this._drag) return;
+
++    const dx = Math.round((ev.clientX - this._drag.startX) / this._drag.scale);
+
++    const dy = Math.round((ev.clientY - this._drag.startY) / this._drag.scale);
+
++    const target = this._deepClone(this._drag.original);
+
++    this._moveElement(target, dx, dy);
+
++    this.state.payload[this._drag.index] = target;
+
++    this._refreshYaml();
+
++    this.render();
+
++  }
+
++
+
++  _onDragEnd() {
+
++    if (!this._drag) return;
+
++    this._drag = null;
+
++    window.removeEventListener("mousemove", this._boundMouseMove);
+
++    window.removeEventListener("mouseup", this._boundMouseUp);
+
++    this._schedulePreview(120);
+
++    this.render();
+
++  }
+
++
+
++  _setSelected(index) { this.state.selectedIndex = index; this.render(); }
+
++  _updateLabelField(field, rawValue) {
+
++    const numeric = new Set(["width", "height", "rotate", "density"]);
+
++    this.state[field] = numeric.has(field) ? Number(rawValue) : rawValue;
+
++    this._refreshYaml(); this._schedulePreview(120); this.render();
+
++  }
+
++  _selectedElement() { return this.state.payload[this.state.selectedIndex] || null; }
+
++
+
++  _updateElementField(key, rawValue) {
+
++    const selected = this._selectedElement(); if (!selected) return;
+
++    let value = rawValue;
+
++    if (typeof selected[key] === "number") value = rawValue === "" ? 0 : Number(rawValue);
+
++    else if (typeof selected[key] === "boolean") value = Boolean(rawValue);
+
++    selected[key] = value;
+
++    this._refreshYaml(); this._schedulePreview(120); this.render();
+
++  }
+
++
+
++  _updateElementJson(text) {
+
++    const selected = this._selectedElement(); if (!selected) return;
+
++    try {
+
++      const parsed = JSON.parse(text);
+
++      this.state.payload[this.state.selectedIndex] = parsed;
+
++      this.state.error = "";
+
++      this._refreshYaml(); this._schedulePreview(120); this.render();
+
++    } catch (err) {
+
++      this.state.error = `JSON error: ${err.message}`; this.render();
+
++    }
+
++  }
+
++
+
++  async _copyYaml() { await navigator.clipboard.writeText(this.state.yamlText); this.state.info = "YAML copied."; this.render(); }
+
++
+
++  _renderField(key, value) {
+
++    if (typeof value === "boolean") return `<label class="field checkbox"><span>${key}</span><input data-field="${key}" type="checkbox" ${value ? "checked" : ""}/></label>`;
+
++    if (typeof value === "number") return `<label class="field"><span>${key}</span><input data-field="${key}" type="number" value="${value}"/></label>`;
+
++    if (typeof value === "string" && (key === "value" || value.includes("\n") || value.length > 40)) {
+
++      return `<label class="field"><span>${key}</span><textarea data-field="${key}" rows="${Math.max(3, Math.min(8, value.split("\n").length + 1))}">${this._escape(value)}</textarea></label>`;
+
++    }
+
++    return `<label class="field"><span>${key}</span><input data-field="${key}" type="text" value="${this._escapeAttr(String(value))}"/></label>`;
+
++  }
+
++
+
++  _renderSelectedEditor() {
+
++    const selected = this._selectedElement();
+
++    if (!selected) return `<div class="empty">Select an element to edit it.</div>`;
+
++    const primitiveFields = [], complexFields = [];
+
++    for (const [key, value] of Object.entries(selected)) {
+
++      if (value !== null && typeof value === "object") complexFields.push([key, value]);
+
++      else primitiveFields.push([key, value]);
+
++    }
+
++    return `<div class="sectionHeader"><strong>${this._escape(selected.type || "element")}</strong><div class="sectionActions"><button id="duplicateSelected" class="small">Duplicate</button><button id="removeSelected" class="small danger">Delete</button></div></div><div class="fields">${primitiveFields.map(([k, v]) => this._renderField(k, v)).join("")}</div>${complexFields.length ? `<div class="complexWrap">${complexFields.map(([k, v]) => `<label class="field"><span>${k} (JSON)</span><textarea data-complex-field="${k}" rows="5">${this._escape(JSON.stringify(v, null, 2))}</textarea></label>`).join("")}</div>` : ""}<label class="field"><span>Whole element JSON</span><textarea id="elementJson" rows="10">${this._escape(JSON.stringify(selected, null, 2))}</textarea></label><button id="applyElementJson" class="applyBtn">Apply JSON</button>`;
+
++  }
+
++
+
++  _escape(str) { return String(str).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"); }
+
++  _escapeAttr(str) { return this._escape(str).replaceAll('"', "&quot;"); }
+
++
+
++  render() {
+
++    const scale = this._stageScale();
+
++    const stageW = Math.round(this.state.width * scale);
+
++    const stageH = Math.round(this.state.height * scale);
+
++    const addTypes = ["text","multiline","new_multiline","line","rectangle","rectangle_pattern","circle","ellipse","icon","dlimg","qrcode","datamatrix","barcode","progress_bar","diagram","plot"];
+
++
+
++    this.shadowRoot.innerHTML = `
+
++      <style>
+
++        :host { display:block; height:100%; color:var(--primary-text-color); --panel-gap:14px; --border:1px solid var(--divider-color); --surface:var(--card-background-color); --muted:var(--secondary-text-color); --accent:var(--primary-color); --danger:var(--error-color); background:var(--primary-background-color); }
+
++        * { box-sizing:border-box; }
+
++        .page { padding:16px; display:grid; grid-template-columns:340px minmax(420px,1fr) 360px; gap:var(--panel-gap); min-height:100%; }
+
++        @media (max-width:1250px) { .page { grid-template-columns:320px 1fr; } .right { grid-column:1 / -1; } }
+
++        @media (max-width:860px) { .page { grid-template-columns:1fr; } }
+
++        .card { background:var(--surface); border-radius:18px; border:var(--border); padding:14px; box-shadow:var(--ha-card-box-shadow, none); }
+
++        .titleRow,.sectionHeader { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+
++        h1,h2 { margin:0; line-height:1.2; } h1{font-size:1.4rem;} h2{font-size:1rem;}
+
++        .subtle { color:var(--muted); font-size:.92rem; }
+
++        .fields { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+
++        .field { display:flex; flex-direction:column; gap:6px; font-size:.9rem; }
+
++        .checkbox { flex-direction:row; align-items:center; justify-content:space-between; padding-top:26px; }
+
++        .field > span { color:var(--muted); font-size:.85rem; }
+
++        input,select,textarea,button{ font:inherit; }
+
++        input,select,textarea{ width:100%; border-radius:12px; border:var(--border); background:var(--secondary-background-color); color:var(--primary-text-color); padding:9px 10px; }
+
++        textarea{ resize:vertical; min-height:42px; }
+
++        button{ border:none; border-radius:12px; padding:10px 12px; cursor:pointer; background:var(--accent); color:var(--text-primary-color, white); }
+
++        button.secondary{ background:var(--secondary-background-color); color:var(--primary-text-color); border:var(--border); }
+
++        button.small{ padding:8px 10px; font-size:.85rem; }
+
++        button.danger{ background: color-mix(in srgb, var(--danger) 22%, var(--surface)); color: var(--primary-text-color); border: var(--border); }
+
++        .stack{ display:flex; flex-direction:column; gap:12px; }
+
++        .toolbar,.footerButtons,.sectionActions{ display:flex; flex-wrap:wrap; gap:8px; }
+
++        .chip { background:var(--secondary-background-color); color:var(--primary-text-color); border:var(--border); border-radius:999px; padding:8px 10px; cursor:pointer; font-size:.84rem; }
+
++        .layoutWrap{ display:grid; gap:12px; }
+
++        .stageShell{ display:flex; align-items:center; justify-content:center; min-height:480px; padding:14px; background:linear-gradient(45deg, transparent 24%, rgba(127,127,127,.08) 25%, rgba(127,127,127,.08) 26%, transparent 27%, transparent 74%, rgba(127,127,127,.08) 75%, rgba(127,127,127,.08) 76%, transparent 77%, transparent),linear-gradient(45deg, transparent 24%, rgba(127,127,127,.08) 25%, rgba(127,127,127,.08) 26%, transparent 27%, transparent 74%, rgba(127,127,127,.08) 75%, rgba(127,127,127,.08) 76%, transparent 77%, transparent); background-size:22px 22px; background-position:0 0,11px 11px; border-radius:18px; border:var(--border); }
+
++        .stage{ position:relative; width:${stageW}px; height:${stageH}px; border-radius:12px; overflow:hidden; border:2px solid color-mix(in srgb, var(--accent) 28%, var(--divider-color)); background:#fff; box-shadow:0 14px 40px rgba(0,0,0,.22); }
+
++        .stage img{ width:100%; height:100%; object-fit:fill; display:block; image-rendering:pixelated; }
+
++        .overlayBox{ position:absolute; border:2px solid rgba(38,127,255,.7); background:rgba(38,127,255,.10); border-radius:8px; cursor:move; }
+
++        .overlayBox.selected{ border-color:rgba(255,121,0,.9); background:rgba(255,121,0,.16); }
+
++        .overlayBoxLabel{ position:absolute; top:-18px; left:0; font-size:.73rem; padding:2px 6px; border-radius:999px; background:rgba(0,0,0,.66); color:white; white-space:nowrap; }
+
++        .stageMeta,.titleRow { gap:10px; } .stageMeta{ display:flex; justify-content:space-between; font-size:.86rem; color:var(--muted); }
+
++        .list{ display:flex; flex-direction:column; gap:8px; max-height:340px; overflow:auto; margin-top:10px; }
+
++        .listItem{ display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center; padding:10px; border-radius:14px; border:var(--border); background:var(--secondary-background-color); cursor:pointer; }
+
++        .listItem.active{ outline:2px solid color-mix(in srgb, var(--accent) 40%, transparent); }
+
++        .mono{ font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
++        .yamlBox{ min-height:300px; }
+
++        .status{ border-radius:14px; padding:10px 12px; font-size:.9rem; border:var(--border); }
+
++        .status.error{ background: color-mix(in srgb, var(--danger) 12%, var(--surface)); }
+
++        .status.info{ background: color-mix(in srgb, var(--accent) 10%, var(--surface)); }
+
++        .empty{ color:var(--muted); padding:12px 0; }
+
++        .complexWrap{ margin-top:10px; display:flex; flex-direction:column; gap:10px; }
+
++        .applyBtn{ margin-top:8px; width:100%; }
+
++        .dim{ opacity:.7; }
+
++      </style>
+
++      <div class="page">
+
++        <div class="left stack">
+
++          <div class="card">
+
++            <div class="titleRow"><div><h1>Niimbot Editor</h1><div class="subtle">Built-in Home Assistant editor for ${this.state.printers.length} printer${this.state.printers.length === 1 ? "" : "s"}.</div></div></div>
+
++            ${this.state.error ? `<div class="status error">${this._escape(this.state.error)}</div>` : ""}
+
++            ${this.state.info ? `<div class="status info">${this._escape(this.state.info)}</div>` : ""}
+
++            <div class="fields" style="margin-top:12px;">
+
++              <label class="field" style="grid-column:1 / -1;"><span>Printer</span><select id="printerSelect"><option value="">Select a printer</option>${this.state.printers.map((p) => `<option value="${p.entry_id}" ${p.entry_id === this.state.selectedPrinter ? "selected" : ""}>${this._escape(p.title)}${p.loaded ? "" : " (not loaded)"}</option>`).join("")}</select></label>
+
++              <label class="field"><span>Width</span><input id="labelWidth" type="number" value="${this.state.width}"/></label>
+
++              <label class="field"><span>Height</span><input id="labelHeight" type="number" value="${this.state.height}"/></label>
+
++              <label class="field"><span>Rotate</span><select id="labelRotate">${[0,90,180,270].map((v) => `<option value="${v}" ${v === Number(this.state.rotate) ? "selected" : ""}>${v}°</option>`).join("")}</select></label>
+
++              <label class="field"><span>Density</span><select id="labelDensity">${[1,2,3,4,5].map((v) => `<option value="${v}" ${v === Number(this.state.density) ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+
++            </div>
+
++            <div class="toolbar">${addTypes.map((type) => `<button class="chip" data-add-type="${type}">${type}</button>`).join("")}</div>
+
++            <div class="footerButtons" style="margin-top:12px;"><button id="previewNow" class="secondary">${this.state.busy ? "Refreshing…" : "Refresh preview"}</button><button id="printNow" ${this.state.printing ? "disabled" : ""}>${this.state.printing ? "Printing…" : "Print label"}</button></div>
+
++          </div>
+
++          <div class="card"><div class="sectionHeader"><h2>Elements</h2><div class="subtle">${this.state.payload.length} total</div></div><div class="list">${this.state.payload.map((el, idx) => `<div class="listItem ${idx === this.state.selectedIndex ? "active" : ""}" data-select-index="${idx}"><div><div><strong>${idx + 1}. ${this._escape(el.type || "element")}</strong></div><div class="subtle mono">${this._escape(this._elementSummary(el))}</div></div><button class="small secondary" data-select-index="${idx}">Edit</button></div>`).join("") || `<div class="empty">No elements yet.</div>`}</div></div>
+
++          <div class="card"><div class="sectionHeader"><h2>Templates</h2><div class="sectionActions"><button id="saveTemplate" class="small secondary">Save</button></div></div><div class="list">${this.state.templates.map((tpl) => `<div class="listItem"><div><div><strong>${this._escape(tpl.name)}</strong></div><div class="subtle">${this._escape(tpl.updated_at || "")}</div></div><div class="sectionActions"><button class="small secondary" data-load-template="${this._escapeAttr(tpl.name)}">Load</button><button class="small danger" data-delete-template="${this._escapeAttr(tpl.name)}">Delete</button></div></div>`).join("") || `<div class="empty">No saved templates yet.</div>`}</div></div>
+
++        </div>
+
++        <div class="middle stack">
+
++          <div class="card layoutWrap"><div class="sectionHeader"><div><h2>Preview stage</h2><div class="subtle">Drag the blue boxes to reposition common element types. The rendered preview remains the source of truth.</div></div></div><div class="stageShell"><div class="stage">${this.state.previewImage ? `<img src="${this.state.previewImage}" alt="Preview"/>` : ""}${this.state.payload.map((el, idx) => { const box = this._elementBox(el); return `<div class="overlayBox ${idx === this.state.selectedIndex ? "selected" : ""}" data-overlay-index="${idx}" style="left:${Math.round(box.x * scale)}px; top:${Math.round(box.y * scale)}px; width:${Math.max(8, Math.round(box.w * scale))}px; height:${Math.max(8, Math.round(box.h * scale))}px;"><div class="overlayBoxLabel">${this._escape(el.type || "element")}</div></div>`; }).join("")}</div></div><div class="stageMeta"><div>${this.state.width} × ${this.state.height}px · rotate ${this.state.rotate}° · density ${this.state.density}</div><div class="${this.state.busy ? "" : "dim"}">${this.state.busy ? "Rendering preview…" : "Preview ready"}</div></div></div>
+
++          <div class="card"><div class="sectionHeader"><h2>YAML output</h2><button id="copyYaml" class="small secondary">Copy</button></div><textarea class="yamlBox mono" id="yamlOutput">${this._escape(this.state.yamlText)}</textarea></div>
+
++        </div>
+
++        <div class="right stack"><div class="card"><h2>Properties</h2><div class="subtle" style="margin:6px 0 12px;">Quick-edit primitive fields here. For nested structures like plot data, use the JSON blocks.</div>${this._renderSelectedEditor()}</div></div>
+
++      </div>`;
+
++    this._bindEvents();
+
++  }
+
++
+
++  _elementSummary(el) {
+
++    const box = this._elementBox(el); const head = `${Math.round(box.x)},${Math.round(box.y)} · ${Math.round(box.w)}×${Math.round(box.h)}`;
+
++    if (["text","new_multiline","multiline"].includes(el.type)) return `${head} · ${(String(el.value || "")).slice(0, 28)}`;
+
++    if (el.type === "icon") return `${head} · ${el.value || ""}`;
+
++    if (["qrcode","barcode","datamatrix"].includes(el.type)) return `${head} · code`;
+
++    return head;
+
++  }
+
++
+
++  _bindEvents() {
+
++    const byId = (id) => this.shadowRoot.getElementById(id);
+
++    byId("printerSelect")?.addEventListener("change", (ev) => { this.state.selectedPrinter = ev.target.value; this._schedulePreview(0); this.render(); });
+
++    byId("labelWidth")?.addEventListener("input", (ev) => this._updateLabelField("width", ev.target.value));
+
++    byId("labelHeight")?.addEventListener("input", (ev) => this._updateLabelField("height", ev.target.value));
+
++    byId("labelRotate")?.addEventListener("change", (ev) => this._updateLabelField("rotate", ev.target.value));
+
++    byId("labelDensity")?.addEventListener("change", (ev) => this._updateLabelField("density", ev.target.value));
+
++    byId("previewNow")?.addEventListener("click", () => this._preview());
+
++    byId("printNow")?.addEventListener("click", () => this._print());
+
++    byId("copyYaml")?.addEventListener("click", () => this._copyYaml());
+
++    byId("saveTemplate")?.addEventListener("click", () => this._saveTemplate());
+
++    byId("duplicateSelected")?.addEventListener("click", () => this._duplicateSelected());
+
++    byId("removeSelected")?.addEventListener("click", () => this._removeSelected());
+
++    byId("applyElementJson")?.addEventListener("click", () => this._updateElementJson(byId("elementJson")?.value || "{}"));
+
++    this.shadowRoot.querySelectorAll("[data-add-type]").forEach((btn) => btn.addEventListener("click", () => this._addElement(btn.getAttribute("data-add-type"))));
+
++    this.shadowRoot.querySelectorAll("[data-select-index]").forEach((item) => item.addEventListener("click", () => this._setSelected(Number(item.getAttribute("data-select-index")))));
+
++    this.shadowRoot.querySelectorAll(".overlayBox").forEach((item) => { item.addEventListener("mousedown", (ev) => this._startDrag(ev, Number(item.getAttribute("data-overlay-index")))); item.addEventListener("click", (ev) => { ev.stopPropagation(); this._setSelected(Number(item.getAttribute("data-overlay-index"))); }); });
+
++    this.shadowRoot.querySelectorAll("[data-load-template]").forEach((btn) => btn.addEventListener("click", () => this._loadTemplate(btn.getAttribute("data-load-template"))));
+
++    this.shadowRoot.querySelectorAll("[data-delete-template]").forEach((btn) => btn.addEventListener("click", () => this._deleteTemplate(btn.getAttribute("data-delete-template"))));
+
++    this.shadowRoot.querySelectorAll("[data-field]").forEach((input) => { const key = input.getAttribute("data-field"); if (input.type === "checkbox") input.addEventListener("change", (ev) => this._updateElementField(key, ev.target.checked)); else input.addEventListener("input", (ev) => this._updateElementField(key, ev.target.value)); });
+
++    this.shadowRoot.querySelectorAll("[data-complex-field]").forEach((input) => { const key = input.getAttribute("data-complex-field"); input.addEventListener("change", (ev) => { const selected = this._selectedElement(); if (!selected) return; try { selected[key] = JSON.parse(ev.target.value); this.state.error = ""; this._refreshYaml(); this._schedulePreview(120); } catch (err) { this.state.error = `JSON error in ${key}: ${err.message}`; } this.render(); }); });
+
++  }
+
++}
+
++customElements.define("niimbot-label-editor-panel", NiimbotLabelEditorPanel);
+
+--- a/custom_components/niimbot/manifest.json
++++ b/custom_components/niimbot/manifest.json
+@@ -30,7 +30,8 @@
+   ],
+
+   "config_flow": true,
+
+   "dependencies": [
+
+-    "bluetooth_adapters"
+
++    "bluetooth_adapters",
+
++    "frontend"
+
+   ],
+
+   "documentation": "https://www.github.com/eigger/hass-niimbot",
+
+   "domain": "niimbot",
+
