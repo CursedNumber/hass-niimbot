@@ -2191,7 +2191,7 @@
 
 +}
 
-+customElements.define("niimbot-label-editor-panel", NiimbotLabelEditorPanel);
++customElements.define("niimbot-editor-panel", NiimbotLabelEditorPanel);
 
 --- a/custom_components/niimbot/manifest.json
 +++ b/custom_components/niimbot/manifest.json
